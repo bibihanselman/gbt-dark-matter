@@ -1,0 +1,10 @@
+info_path: "/home/dataadmin/GBTData/SharedDataDirectory/cband_052726/all_cband_info.csv"
+data_dir: "/home/dataadmin/GBTData/SharedDataDirectory/cband_052726/data/preprocessed"
+analysis_dir: "/home/dataadmin/GBTData/SharedDataDirectory/cband_052726/analyses/072026/exclusion"
+population_dir: "/home/dataadmin/GBTData/SharedDataDirectory/cband_052726/analyses/072026/target_selection"
+calibration_dir: "/home/dataadmin/GBTData/SharedDataDirectory/cband_052726/data/median_sefds"
+whack_save_dir: "/home/dataadmin/GBTData/SharedDataDirectory/cband_052726/analyses/072026/whack_a_moles"
+sefd: 10
+size_init: 1e-31
+ref_signal_size: 1e-29
+case: "decay"

@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../dataadmin/GBTData/SharedDataDirectory/cband_052726"
+		},
+		{
+			"path": "../../dataadmin/GBTData/SharedDataDirectory/lscx_081526"
+		}
+	],
+	"settings": {}
+}

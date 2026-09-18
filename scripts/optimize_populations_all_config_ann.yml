@@ -1,0 +1,6 @@
+info_path: "/home/dataadmin/GBTData/SharedDataDirectory/cband_052726/all_cband_info.csv"
+data_dir: "/home/dataadmin/GBTData/SharedDataDirectory/cband_052726/data/preprocessed"
+save_dir: "/home/dataadmin/GBTData/SharedDataDirectory/cband_052726/analyses/072026/target_selection/ann"
+sefd: 10
+interaction: "ann"
+n_banks: 4
