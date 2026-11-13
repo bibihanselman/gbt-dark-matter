@@ -27,6 +27,7 @@ from scipy.stats import combine_pvalues
 from itertools import chain
 import argparse
 import yaml
+from scipy.integrate import quad
 
 from whack_a_mole import WhackAMole
 
@@ -36,6 +37,120 @@ c = 299792
 v_virial = 250 # km/s
 v_earth = 225 # km/s
 dm_profile = 'nfw'
+
+##### TEMPLATES #####
+
+### Integrals
+
+R_s = 7.9 # distance from the center of galaxy to the sun
+
+# Parameters for Navarro-Frenk-White
+rho_c_nfw = 1.4e7
+r_c_nfw = 16.1
+
+
+def r_prime(r, b, l):
+    # find the coordinate-transformed radius
+    return math.sqrt(r*r + R_s*R_s - 2*R_s*r*math.cos(b)*math.cos(l))
+
+def nfw(r_prime):
+    ratio = r_prime / r_c_nfw
+    return rho_c_nfw / (ratio * (1+ratio) * (1+ratio))
+
+def integrate(func, target_b_deg, target_l_deg, annihilation=False):
+    target_b, target_l = math.radians(target_b_deg), math.radians(target_l_deg)
+    def integrand(r):
+        val = func(r_prime(r, target_b, target_l))
+        return val*val if annihilation else val
+    return quad(integrand, 0, float('inf'))
+
+decay_amp = integrate(nfw, 90, 90)[0]
+ann_amp = integrate(nfw, 90, 90, annihilation=True)[0]
+
+decay_std = v_virial / (c*np.sqrt(3))
+ann_std = v_virial / (c*np.sqrt(6))
+
+def inject_template(xs, targ, info, is_decay=True):
+    amp_ratio = decay_amp if is_decay else ann_amp
+    col_name = 'nfw' if is_decay else 'nfw_sq'
+    std = decay_std if is_decay else ann_std
+
+    bank_info = info.set_index('time')
+
+    theta = bank_info.loc[targ[:-4], 'theta']
+    radians_from_v_earth = np.radians(theta)
+    shift_factor = v_earth / c * np.cos(radians_from_v_earth)
+    sig_loc = shift_factor
+    integral = bank_info.loc[targ[:-4], col_name]
+    sig_amp =  integral / amp_ratio * 1e-2 * (1 + shift_factor)
+    sig_std = std * (1 + shift_factor)
+    spec = 1 + sig_amp*np.exp(-(xs - sig_loc)**2 / (2*sig_std**2))
+
+    injected = np.array([xs, spec])
+    return injected
+
+##### INJECTION #####
+
+def inject_calibrated(
+    name,
+    sig_locs,
+    info,
+    data_dir=None,
+    save_dir=None,
+    sefd=None,
+    signal_sizes=1e-28,
+    is_decay=True,
+):
+    '''General routine for signal injection.'''
+    freq, spec = np.load(os.path.join(data_dir, name))
+    
+    targ_info = info.set_index('time')
+    
+    theta = targ_info.loc[name[:-4], 'theta']
+    shift_factor = get_shift_factor(theta, v_earth)
+        
+    if sefd is None:
+        sefd = 10 * np.ones_like(spec)
+
+    if not isinstance(sefd, (list, np.ndarray)):
+        sefd = sefd * np.ones_like(spec)
+
+    if not isinstance(sig_locs, (list, np.ndarray)):
+        sig_locs = [sig_locs]
+
+    if not isinstance(signal_sizes, (list, np.ndarray)):
+        signal_sizes = [signal_sizes] * len(sig_locs)  
+    
+    if len(sig_locs) != len(signal_sizes):
+        raise ValueError("sig_locs and signal_sizes must have the same length.")
+
+    for sig_loc, signal_size in zip(sig_locs, signal_sizes):
+        # Calculate line intensity
+        if is_decay:
+            sig_std = v_virial*sig_loc/(c*np.sqrt(3))
+            sig_amp_ratio = 2.75e24*signal_size / (v_virial*(sig_loc/1e3)**3) # convert MHz to GHz # Units: Jy
+            col_name = dm_profile
+        else:
+            sig_std = v_virial*sig_loc/(c*np.sqrt(6))
+            sig_amp_ratio = 9.41e14*signal_size / (v_virial*(sig_loc/1e3)**4) # convert MHz to GHz # Units: Jy
+            col_name = dm_profile+'_sq'
+        
+        # Multiply by line-integrated halo density
+        sig_amp = sig_amp_ratio * targ_info.loc[name[:-4], col_name]
+        
+        # Doppler shift
+        sig_loc, sig_std, sig_amp = sig_loc * shift_factor, sig_std * shift_factor, sig_amp / shift_factor
+        
+        # Add the Gaussian to the spectrum
+        g = sig_amp*np.exp(-(freq - sig_loc)**2 / (2*sig_std**2))
+        spec = spec * (sefd + g) / sefd
+    
+    # Save/return the injected spectrum
+    injected = np.array([freq, spec])
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        np.save(os.path.join(save_dir, name), injected)
+    return injected
 
 ##### NORMALIZATION #####
 
@@ -77,31 +192,21 @@ def eval_polynomial(p, x):
     return result
 
 @njit(cache=True)
-def normalize_weighted_numba(data, a=0.1, b=1, exterior=3, order=5, is_decay=True, freq=None, width=200, start=None, stop=None):
+def normalize_weighted_numba(data, a=0.1, b=1, exterior=3, order=5, is_decay=True, template=False):
     """
     Standard rolling polynomial normalize procedure. Updated.
     """
     xs, ys = data
     
     freq_diff = xs[1] - xs[0]
-    ys_mean = ys / ys.mean()
-    for i in range(16, len(ys)-16, 16):  # Excise the 4 unstable valley points in each coarse channel 
-        ys_mean[i] = np.nan
-        ys_mean[i+15] = np.nan
-        ys_mean[i+1] = np.nan
-        ys_mean[i+14] = np.nan
-    
-    xs_trimmed = xs
-    if freq is not None:
-        index = np.argmin(np.abs(xs - freq))
-        width = int(width / freq_diff)
-        xs_trimmed = xs[index-width:index+width+1]
-    else:
-        if start is not None or stop is not None:
-            start_index = 0 if start is None else np.argmin(np.abs(xs - start))
-            stop_index = len(xs) - 1 if stop is None else np.argmin(np.abs(xs - stop))
-            xs_trimmed = xs[start_index:stop_index+1]
-    
+    ys_copy = ys.copy()
+    if not template:
+        for i in range(16, len(ys)-16, 16):  # Excise the 4 unstable valley points in each coarse channel 
+            ys[i] = np.nan
+            ys[i+15] = np.nan
+            ys[i+1] = np.nan
+            ys[i+14] = np.nan
+        
     new_xs = np.zeros(xs_trimmed.shape[0])
     normalized_spectrum = np.zeros(xs_trimmed.shape[0])
     
@@ -117,30 +222,29 @@ def normalize_weighted_numba(data, a=0.1, b=1, exterior=3, order=5, is_decay=Tru
         return int(ceiled_number + 1) if ceiled_number % 2 == 0 else int(ceiled_number)
 
     # Loop through the data points and divide each point by the polynomial 
-    for j in range(len(xs_trimmed)):
-        x = xs_trimmed[j]
-        new_xs[j] = x
-        #i = xs.tolist().index(x)
-        i = np.where(xs == x)[0][0]
-        window = round_up_to_nearest_odd(2 * exterior * get_sigma(x) / freq_diff)
+    for i, x in enumerate(xs):
+        center = 1 if template else x
+        sigma = get_sigma(center)
+        window = round_up_to_nearest_odd(2 * exterior * sigma / freq_diff)
         
         if (i < (window//2)) or (i >= len(xs) - (window//2 + 1)): 
-            normalized_spectrum[j] = 1
+            normalized_spectrum[i] = 1
+            continue
+            
+        if np.isnan(ys_copy[i]): # checking if the spectrum was nan BEFORE excising the coarse channel valleys
+            normalized_spectrum[i] = np.nan
             continue
 
         ind_xs = np.arange(-(window//2), window//2+1).astype(np.float64)
 
-        current_ys = ys_mean[i-window//2:i+window//2+1]
+        current_ys = ys[i-window//2:i+window//2+1]
         idx = np.isfinite(current_ys)
         
         # Unweighted fit
-        #unweighted_params = np.polyfit(ind_xs[idx], current_ys[idx], order)
         unweighted_p = fit_poly(ind_xs[idx], current_ys[idx], order)
         
         # Weighted fit
-        sigma = get_sigma(x)
         weights = 1 - a*np.exp(-(freq_diff*ind_xs[idx])**2 / (2*b*sigma**2))
-        #weighted_params = np.polyfit(ind_xs[idx], current_ys[idx], order, w=weights)
         weighted_p = fit_poly(ind_xs[idx], current_ys[idx], order, w=weights)
 
         unweighted = eval_polynomial(unweighted_p, 0) #np.poly1d(unweighted_params)
@@ -148,68 +252,85 @@ def normalize_weighted_numba(data, a=0.1, b=1, exterior=3, order=5, is_decay=Tru
 
         normalized_spectrum[j] = unweighted/weighted
         
-    #new_ys = ys_mean[lower: len(xs)-upper]
     normalized = np.zeros((2, new_xs.shape[0]))
     normalized[0] = new_xs
     normalized[1] = normalized_spectrum
-    #old = np.array([new_xs, new_ys])
 
     return normalized
 
 @njit(parallel=True)
-def normalize_all_spectra(spectra, progress, b=1, exterior=3, freq=None, width=100, is_decay=True):
-    # Normalize the first spectrum to get the right shape (and warm up the function)
-    test_spec = spectra[0]
-    test_norm = normalize_weighted_numba(test_spec, b=b, exterior=exterior, freq=freq, width=width, is_decay=is_decay)
-    norm_spectra = np.empty((spectra.shape[0], test_norm.shape[1]))
+def normalize_all_spectra(spectra, progress=None, b=1, exterior=3, is_decay=True, template=False):
+    norm_spectra = np.empty((spectra.shape[0], spectra.shape[2]))
     for i in prange(norm_spectra.shape[0]):
-        norm = normalize_weighted_numba(spectra[i], b=b, exterior=exterior, freq=freq, width=width, is_decay=is_decay)
+        norm = normalize_weighted_numba(spectra[i], b=b, exterior=exterior, is_decay=is_decay, template=template)
         norm_spectra[i] = norm[1]
-        progress.update(1)
+        if progress:
+            progress.update(1)
     return norm_spectra
+
+##### QUALITY CUT #####
+
+@njit(nogil=True)
+def quality_cut(freqs, spectra, progress=None, freq_diff=1500/8192, rho=0.1):
+    mads = np.empty_like(spectra)
+
+    for i in prange(spectra.shape[0]):
+        for j in range(len(freqs)):
+            half_width_bin = int(2 * factor * freqs[j] / freq_diff)
+            window = spectra[i][max(0, j-half_width_bin):min(len(freqs)-1, j+half_width_bin)]
+            devs = np.zeros(len(window))
+            for k in range(len(window)):
+                devs[k] = np.abs(window[k]-1)
+            mads[i, j] = np.nanmedian(devs)
+        
+        if progress:
+            progress.update(1)
+    
+    quantiles = np.empty_like(mads)
+    for i in prange(mads.shape[1]):
+        quantile = np.nanquantile(mads[:, i], 1-rho)
+        quantiles[:, i] = quantile
+    new_spectra = np.where(mads > quantiles, np.nan, spectra)
+    
+    return new_spectra
 
 ##### ASYMMETRIES AND P-VALUES #####
 
 @njit(cache=True)
-def build_asymmetry(specs, state, mask): #template=False
+def build_asymmetry(specs, state, mask, time_mask=None):
     '''Form asymmetry from a given state.'''
-    inner = (state == 1) & mask
-    outer = (state == 1) & ~mask
 
-    inner_slice = specs[inner, :]
-    outer_slice = specs[outer, :]
-    inner_mean = np.zeros(specs.shape[1])
-    outer_mean = np.zeros(specs.shape[1])
-    
-    for j in range(specs.shape[1]):
-        inner_mean[j] = inner_slice[:, j].mean()
-        outer_mean[j] = outer_slice[:, j].mean()
+    if time_mask is not None:
+        inner_mean_pre = np.nanmean(specs[(state == 1) & mask & time_mask], axis=0)
+        inner_mean_post = np.nanmean(specs[(state == 1) & mask & ~time_mask], axis=0)
+        outer_mean_pre = np.nanmean(specs[(state == 1) & ~mask & time_mask], axis=0)
+        outer_mean_post = np.nanmean(specs[(state == 1) & ~mask & ~time_mask], axis=0)
 
-    asymmetry = (inner_mean - outer_mean) / (inner_mean + outer_mean)
-    
+        asymmetry = (inner_mean_pre + inner_mean_post - outer_mean_pre - outer_mean_post) / (inner_mean_pre + inner_mean_post + outer_mean_pre + outer_mean_post)
+
+    else:
+        inner_mean = np.nanmean(specs[(state == 1) & mask], axis=0)
+        outer_mean = np.nanmean(specs[(state == 1) & ~mask], axis=0)
+
+        asymmetry = (inner_mean - outer_mean) / (inner_mean + outer_mean)
+
     return asymmetry
 
-def correlate_asymmetry(freqs, spectrum, template, ref_freq=5000):
-    def stretch_template(template, stretch_factor):
-        if template.shape[0] % 2 == 0:
-            template = template[1:] # Make the number of points odd
-        k = template.shape[0] // 2
-        orig_x = np.arange(-k, k+1)
-        interp_func = interp1d(orig_x, template, bounds_error=False, fill_value=0)
-        new_k = ((2*k + 1)/stretch_factor - 1)/2 # 2k_1 + 1 = sf*(2k_0 + 1)
-        new_x = np.linspace(-new_k, new_k, template.shape[0])
-
-        return interp_func(new_x)
+def correlate_asymmetry(xs, template_xs, spectrum, template):
 
     def get_a(target, template):
+        target = np.nan_to_num(target)
         return np.dot(target, template) / (np.dot(template, template) + 1e-12)
     
     a_vals = np.zeros_like(spectrum)
-    residuals = np.zeros_like(spectrum)
-    lower = (len(template) - 1) // 2
-    upper = (len(template) + 1) // 2
-    for i in range(len(spectrum)):
-        stretched = stretch_template(template, freqs[i] / ref_freq)
+
+    for i, freq in enumerate(xs):
+        half_width_bin = float((3 * factor * freq) // freq_diff)
+        new_xs = np.arange(-half_width_bin, half_width_bin+1) * freq_diff + freq
+        stretched = np.interp(new_xs, freq * template_xs, template)
+
+        lower = (len(template) - 1) // 2
+        upper = (len(template) + 1) // 2
         
         if i < lower:
             x = lower - i
@@ -224,30 +345,47 @@ def correlate_asymmetry(freqs, spectrum, template, ref_freq=5000):
         
         a = get_a(window, stretched) 
         a_vals[i] = a 
-        residuals[i] = np.sqrt(np.mean((a*stretched-window)**2)) 
 
-    return a_vals / (residuals + 1e-12)
+    return a_vals
 
-def get_pvals_cont(inj, uninj):
-    stds = []
-    for i in range(len(uninj)):
-        if i < 140:
-            stds.append(np.std(uninj[:i+140]))
-        elif i >= len(uninj) - 140:
-            stds.append(np.std(uninj[i-140:]))
+def get_pval_spectrum(xs, inj, uninj):
+    stds = np.zeros_like(uninj)
+
+    for i, freq in enumerate(xs):
+        half_width_bin = (6 * factor * freq) // freq_diff
+        if i < half_width_bin:
+            window = uninj[:i+half_width_bin+1]
+        elif i >= len(xs) - half_width:
+            window = uninj[i-half_width_bin:]
         else:
-            stds.append(np.std(uninj[i-140:i+140]))
+            window = uninj[i-half_width_bin:i+half_width_bin+1]
+        stds[i] = np.nanstd(window)
     
     sigmas = inj / stds
     pvals = list(map(lambda sigma: .5*math.erfc(sigma/np.sqrt(2)), sigmas))
     return pvals
 
-def calculate_pvals(iter, freqs, signal_sizes, b=1, exterior=3, **kwargs):
-    print(f'Iteration {iter}') 
+def calculate_pvals(iter, freqs, signal_sizes, b=1, exterior=3, bank=0, **kwargs):
+    print(f'Iteration {iter}')
+
     # Injections
     inj_spectra = np.empty((len(targs), 2, len(xs)))
-    sefd = np.load(os.path.join(calibration_bank_dir, 'median.npy'))[1]
+    if bank < 6:
+        sefd_all = np.load(os.path.join(calibration_bank_dir, 'median_smoothed.npy'))[1]
+    else:
+        path_pre = os.path.join(calibration_bank_dir, 'pre23_median_smoothed.npy')
+        path_post = os.path.join(calibration_bank_dir, 'post23_median_smoothed.npy')
+        if os.path.exists(path_pre):
+            sefd_pre = np.load(path_pre)[1]
+        if os.path.exists(path_post):
+            sefd_post = np.load(path_post)[1]
+
     for i, targ in enumerate(targs):
+        if bank < 6:
+            sefd = sefd_all
+        else:
+            sefd = sefd_pre if time_mask[i] else sefd_post
+        
         inj_spectra[i] = inject_calibrated(
             targ,
             freqs,
@@ -259,34 +397,31 @@ def calculate_pvals(iter, freqs, signal_sizes, b=1, exterior=3, **kwargs):
         )
 
     # Normalization
-    with ProgressBar(total=len(targs)) as progress:
-        inj_norm_spectra = normalize_all_spectra(inj_spectra, progress, b=b, exterior=exterior, is_decay=is_decay)
+    inj_norm_spectra = normalize_all_spectra(inj_spectra, b=b, exterior=exterior, is_decay=is_decay)
     
     # Build asymmetries
-    asymmetry_uninj_int = build_asymmetry(uninj_norm_spectra, state_int, int_mask)
-    asymmetry_inj_int = build_asymmetry(inj_norm_spectra, state_int, int_mask)
-    template_int = build_asymmetry(template_spectra, state_int, int_mask)
-    template_smooth_int = make_interp_spline(template_xs[::15], template_int[::15], k=3)(template_xs)
+    asymmetry_uninj_int = build_asymmetry(uninj_norm_spectra, state_int, int_mask, time_mask=time_mask)
+    asymmetry_inj_int = build_asymmetry(inj_norm_spectra, state_int, int_mask, time_mask=time_mask)
+    template_int = build_asymmetry(template_spectra, state_int, int_mask, time_mask=time_mask)
 
-    asymmetry_uninj_dopp = build_asymmetry(uninj_norm_spectra, state_dopp, dopp_mask)
-    asymmetry_inj_dopp = build_asymmetry(inj_norm_spectra, state_dopp, dopp_mask)
-    template_dopp = build_asymmetry(template_spectra, state_dopp, dopp_mask)
-    template_smooth_dopp = make_interp_spline(template_xs[::15], template_dopp[::15], k=3)(template_xs)
+    asymmetry_uninj_dopp = build_asymmetry(uninj_norm_spectra, state_dopp, dopp_mask, time_mask=time_mask)
+    asymmetry_inj_dopp = build_asymmetry(inj_norm_spectra, state_dopp, dopp_mask, time_mask=time_mask)
+    template_dopp = build_asymmetry(template_spectra, state_dopp, dopp_mask, time_mask=time_mask)
 
-    corr_uninj_int = correlate_asymmetry(xs, asymmetry_uninj_int, template_smooth_int, **kwargs)
-    corr_inj_int = correlate_asymmetry(xs, asymmetry_inj_int, template_smooth_int, **kwargs)
+    corr_uninj_int = correlate_asymmetry(xs, template_xs, asymmetry_uninj_int, template_int)
+    corr_inj_int = correlate_asymmetry(xs, template_xs, asymmetry_inj_int, template_int)
 
-    corr_uninj_dopp = correlate_asymmetry(xs, asymmetry_uninj_dopp, template_smooth_dopp, **kwargs)
-    corr_inj_dopp = correlate_asymmetry(xs, asymmetry_inj_dopp, template_smooth_dopp, **kwargs)
+    corr_uninj_dopp = correlate_asymmetry(xs, template_xs, asymmetry_uninj_dopp, template_dopp)
+    corr_inj_dopp = correlate_asymmetry(xs, template_xs, asymmetry_inj_dopp, template_dopp)
 
-    pvals_int = get_pvals_cont(corr_inj_int, corr_uninj_int)
-    pvals_dopp = get_pvals_cont(corr_inj_dopp, corr_uninj_dopp)
+    pvals_int = get_pval_spectrum(xs, corr_inj_int, corr_uninj_int)
+    pvals_dopp = get_pval_spectrum(xs, corr_inj_dopp, corr_uninj_dopp)
     pvals_comb = np.array([combine_pvalues([pval_int, pval_dopp])[1] for pval_int, pval_dopp in zip(pvals_int, pvals_dopp)]) #np.multiply(pvals_int, pvals_dopp)
 
     def get_pval(freq):
         idx = np.argmin(np.abs(freq - xs))
-        pvals_comb_filt = pvals_comb[pvals_comb != 0]
-        pval = np.min(pvals_comb_filt[idx-20:idx+20])
+        pvals_comb_filt = np.where(pvals_comb == 0, np.nan, pvals_comb)
+        pval = np.nanmin(pvals_comb_filt[idx-20:idx+20])
         return pval
     
     pvals = np.array(list(map(get_pval, freqs)))
@@ -336,14 +471,14 @@ def calculate_pvals(iter, freqs, signal_sizes, b=1, exterior=3, **kwargs):
     sfigs[0].suptitle('Asymmetries and Correlations')
     sfigs[1].suptitle('P-Values')
     
-    save_path = os.path.join(root_bank_dir, 'plots')
+    save_path = os.path.join(root_bank_dir, 'plots', str(freqs[0])) # tail: start freq
     os.makedirs(save_path, exist_ok=True)
     plt.savefig(os.path.join(save_path, f'iter_{iter}.png'))
     
     ##################################################################
     
     # Save some data
-    path_to_save = os.path.join(root_bank_dir, f'pvals/iter_{iter}')
+    path_to_save = os.path.join(root_bank_dir, 'pvals', str(freqs[0]), f'iter_{iter}')
     os.makedirs(path_to_save, exist_ok=True)
     
     np.save(os.path.join(path_to_save, 'doppler_pvals.npy'), np.array([xs, get_pvals_cont(corr_inj_dopp, corr_uninj_dopp)]))
@@ -402,42 +537,61 @@ if __name__ == '__main__':
     state_dir = config['population_dir']
     calibration_dir = config['calibration_dir']
     whack_dir = config['whack_save_dir']
-    sefd = config.get('sefd', 10)
     size_init = float(config.get('size_init', 1e-30))
-    ref_signal_size = float(config.get('ref_signal_size', 1e-28))
+    ref_signal_size = float(config.get('ref_signal_size', 1e-2))
     case = config.get('case', 'decay')
     is_decay = case == 'decay'
 
     root_dir = os.path.join(analysis_dir, case)
 
-    info = pd.read_csv(info_path)
+    info = pd.read_csv(info_path, sep='\t')
 
-    banks = os.listdir(data_dir)
+    banks = sorted([int(bank) for bank in os.listdir(data_dir)])
 
     three_sigma = .5*math.erfc(3/np.sqrt(2))
 
-    plt.rcParams.update({'font.size': 14, 'axes.labelsize': 14})
+    blanking_ranges = [
+        [
+            (750, 1320),
+            (1520, 1660),
+            (1880, 2260)
+        ],
+        [
+            (1650, 1950),
+            (2170, 2260),
+            (2310, 2520),
+            (2720, 3160)
+        ],
+        [
+            (3560, 3950), #4200
+            (7970, 8440)
+        ],
+        [
+            (7500, 8160),
+            (10430, 10600),
+            (11500, 12380)
+        ]
+    ]
+    start_banks = [0, 1, 2, 6]
 
-    start_time = datetime.datetime.now()
+    start_time = time.perf_counter()
 
     for bank in banks:
         print(f'Bank {bank} start!')
-        root_bank_dir = os.path.join(root_dir, bank)
+        root_bank_dir = os.path.join(root_dir, str(bank))
         os.makedirs(root_bank_dir, exist_ok=True)
-        calibration_bank_dir = os.path.join(calibration_dir, bank)
+        calibration_bank_dir = os.path.join(calibration_dir, str(bank))
         
         # Load in template spectra
-        bank_dir = os.path.join(data_dir, bank)
+        bank_dir = os.path.join(data_dir, str(bank))
         bank_info = info[info['source'].apply(lambda l: l + '.npy').isin(os.listdir(bank_dir))]
         
         # Load in xs
         xs = np.load(os.path.join(bank_dir, os.listdir(bank_dir)[0]))[0]
-        freq_diff = xs[1] - xs[0]
-        ref_freq = (xs[0] + xs[-1]) / 2 # Center of bank
 
         # Optimized states
-        state_int_all = np.load(os.path.join(state_dir, case, bank, 'intensity/best_state.npy'))
-        state_dopp_all = np.load(os.path.join(state_dir, case, bank, 'doppler/best_state.npy'))
+        state_int_all = np.load(os.path.join(state_dir, case, str(bank), 'intensity/best_state.npy'))
+        state_dopp_all = np.load(os.path.join(state_dir, case, str(bank), 'doppler/best_state.npy'))
         # Exclude the spectra appearing in neither state, and prepare states/masks for asymmetry formation
         state_mask = (state_int_all == 1) | (state_dopp_all == 1)
         bank_info = bank_info[state_mask]
@@ -445,66 +599,74 @@ if __name__ == '__main__':
         state_int, state_dopp = state_int_all[state_mask], state_dopp_all[state_mask]
         int_mask = (bank_info['phi'] < 90).to_numpy()
         dopp_mask = (bank_info['theta'] < 90).to_numpy()
+        time_mask = bank_info['epoch'].apply(lambda x: int(x[4:6]) < 23).to_numpy() if bank >= 6 else None
 
         # Normalize uninjected spectra
         uninj_spectra = np.array([np.load(os.path.join(bank_dir, targ)) for targ in targs])
+
+        band_idx = max([i for i, start_bank in enumerate(start_banks) if start_bank <= bank])
+        condition = np.any(
+            [
+                (xs > blank[0]) & (xs < blank[1])
+                for blank in blanking_ranges[band_idx]
+            ],
+            axis=0
+        )
+
         if os.path.exists(os.path.join(root_bank_dir, 'uninj_norm_spectra.npy')):
             print('Loading uninj norm spectra')
             uninj_norm_spectra = np.load(os.path.join(root_bank_dir, 'uninj_norm_spectra.npy'))
         else:
             print('Normalizing uninjected')
+            
+            # Normalize
             with ProgressBar(total=len(targs)) as progress:
-                uninj_norm_spectra = normalize_all_spectra(uninj_spectra, progress, b=1, exterior=3)
+                uninj_norm_spectra = normalize_all_spectra(uninj_spectra, progress=progress, b=1, exterior=3)
+            
+            # Quality cut
+            with ProgressBar(total=len(targs)) as progress:
+                uninj_norm_spectra = quality_cut(xs, uninj_norm_spectra, progress=progress)            
+            
+            # Blanking ranges
+            uninj_norm_spectra = np.where(condition, np.nan, uninj_norm_spectra)
+
+            # Save!
             np.save(os.path.join(root_bank_dir, 'uninj_norm_spectra.npy'), uninj_norm_spectra)
 
         # Templates
+        template_xs = np.linspace(1-3*factor, 1+3*factor, 500)
         if os.path.exists(os.path.join(root_bank_dir, 'template_spectra.npy')):
             print('Loading template spectra')
             template_spectra = np.load(os.path.join(root_bank_dir, 'template_spectra.npy'))
         else:
             # Injections
-            inj_spectra = np.empty((len(targs), 2, len(xs)))   
-            for i, targ in enumerate(targs):
-                inj_spectra[i] = inject_calibrated(
-                    targ,
-                    ref_freq,
-                    bank_info,
-                    data_dir=bank_dir,
-                    sefd=sefd,
-                    signal_sizes=ref_signal_size, 
-                    is_decay=is_decay,
-                    template=True
-                )
+            inj_spectra = np.array([inject_template(xs, targ, bank_info) for targ in targs])
             print('Normalizing templates')
-            with ProgressBar(total=len(targs)) as progress:
-                template_spectra = normalize_all_spectra(inj_spectra, progress, b=1, exterior=3, freq=ref_freq, width=100)
+            with ProgressBar(total=len(files)) as progress:
+                template_spectra = normalize_all_spectra(inj_spectra, progress, b=1, exterior=3, is_decay=is_decay)
             np.save(os.path.join(root_bank_dir, 'template_spectra.npy'), template_spectra)
-        
-        template_xs = np.arange(template_spectra.shape[1])
-        
+                
         # Uninjected p-values
         print('Calculating uninjected p-values...')
 
-        asymmetry_uninj_int = build_asymmetry(uninj_norm_spectra, state_int, int_mask)
-        template_int = build_asymmetry(template_spectra, state_int, int_mask)
-        template_smooth_int = make_interp_spline(template_xs[::15], template_int[::15], k=3)(template_xs)
+        asymmetry_uninj_int = build_asymmetry(uninj_norm_spectra, state_int, int_mask, time_mask=time_mask)
+        template_int = build_asymmetry(template_spectra, state_int, int_mask, time_mask=time_mask)
 
-        asymmetry_uninj_dopp = build_asymmetry(uninj_norm_spectra, state_dopp, dopp_mask)
-        template_dopp = build_asymmetry(template_spectra, state_dopp, dopp_mask)
-        template_smooth_dopp = make_interp_spline(template_xs[::15], template_dopp[::15], k=3)(template_xs)
+        asymmetry_uninj_dopp = build_asymmetry(uninj_norm_spectra, state_dopp, dopp_mask, time_mask=time_mask)
+        template_dopp = build_asymmetry(template_spectra, state_dopp, dopp_mask, time_mask=time_mask)
 
-        corr_uninj_int = correlate_asymmetry(xs, asymmetry_uninj_int, template_smooth_int, ref_freq=ref_freq)
-        corr_uninj_dopp = correlate_asymmetry(xs, asymmetry_uninj_dopp, template_smooth_dopp, ref_freq=ref_freq)
+        corr_uninj_int = correlate_asymmetry(xs, template_xs, asymmetry_uninj_int, template_int)
+        corr_uninj_dopp = correlate_asymmetry(xs, template_xs, asymmetry_uninj_dopp, template_smooth_dopp)
 
-        pvals_int = get_pvals_cont(corr_uninj_int, corr_uninj_int)
-        pvals_dopp = get_pvals_cont(corr_uninj_dopp, corr_uninj_dopp)
+        pvals_int = get_pvals_cont(xs, corr_uninj_int, corr_uninj_int)
+        pvals_dopp = get_pvals_cont(xs, corr_uninj_dopp, corr_uninj_dopp)
         pvals_comb = np.array([combine_pvalues([pval_int, pval_dopp])[1] for pval_int, pval_dopp in zip(pvals_int, pvals_dopp)])
 
         # Plotting
         fig, axs = plt.subplots(3, 1, figsize=(8,10), sharex=True, sharey=True)
         fig.subplots_adjust(hspace=0.3)
 
-        min_pval = min(chain(pvals_int, pvals_dopp, pvals_comb))
+        min_pval = np.nanmin(np.array([pvals_int, pvals_dopp, pvals_comb]))
         for ax, pval, title in zip(axs, [pvals_int, pvals_dopp, pvals_comb], ['Intensity', 'Doppler', 'Combined']):
             ax.plot(xs, pval, c='k')
             ax.set_title(title, fontsize=18)
@@ -549,10 +711,10 @@ if __name__ == '__main__':
                 'uninj_norm_spectra': uninj_norm_spectra,
                 'uninj_spectra': np.array([np.load(os.path.join(bank_dir, targ))[1] for targ in targs]),
                 'template_spectra': template_spectra,
-                'template_freq': ref_freq,
                 'state_dopp': state_dopp,
                 'state_int': state_int,
-                'info': bank_info
+                'info': bank_info,
+                'blanking_ranges': blanking_ranges[band_idx]
             }
             whack = WhackAMole(whack_config)
             whack.run(save_path=whack_save_path)
@@ -576,12 +738,13 @@ if __name__ == '__main__':
                 freqs = np.arange(start_freq, stop, spacing)
 
                 # "Exponential" search
-                s = [size_init] * len(freqs)
+                power = 3 if is_decay else 4
+                s = [size_init * (freq / 1e3) ** power for freq in freqs]
                 signal_sizes, pvals = [], []
 
                 for i in range(8):
                     print(s)
-                    p = calculate_pvals(i, freqs, s, ref_freq=ref_freq)
+                    p = calculate_pvals(i, freqs, s, bank=bank)
                     print(p)
                     signal_sizes.append(s)
                     pvals.append(p.tolist())
@@ -613,9 +776,9 @@ if __name__ == '__main__':
 
         ax.stairs(2 * limits_all[1], plot_freqs, color='k', label='1-photon states')
         ax.stairs(limits_all[1], plot_freqs, color='k', ls='--', label='2-photon states')
-        get_f_func = np.vectorize(get_f)
-        fs = get_f_func(limits_all[0])
-        ax.stairs(2 / (1 + fs) * limits_all[1], plot_freqs, color='b', label='1-photon states with stimulated emission')
+        # get_f_func = np.vectorize(get_f)
+        # fs = get_f_func(limits_all[0])
+        # ax.stairs(2 / (1 + fs) * limits_all[1], plot_freqs, color='b', label='1-photon states with stimulated emission')
 
         ax.set_yscale('log')
         ax.set_xlim(limits_all[0,0]-step/2, limits_all[0,-1]+step/2)
@@ -626,6 +789,5 @@ if __name__ == '__main__':
         ax.set_ylabel(r'$\lambda$ [s$^{-1}$]' if is_decay else r'$\langle \sigma v \rangle$ [cm$^3$s$^{-1}$]', fontsize=18)
         fig.savefig(os.path.join(root_bank_dir, 'plots', 'exclusion.png'), dpi=300, bbox_inches='tight')    
 
-    end_time = datetime.datetime.now()
-    delta = relativedelta(end_time, start_time)
-    print(f'Study complete in {delta.hours} hrs, {delta.minutes} mins, {delta.seconds} sec')
+    t = datetime.timedelta(seconds=time.perf_counter() - start_time)
+    print(f'Study complete in {t}')
