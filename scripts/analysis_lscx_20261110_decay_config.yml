@@ -1,0 +1,9 @@
+info_path: "/home/dataadmin/GBTData/SharedDataDirectory/lscx_081526/all_lscx_info.csv"
+data_dir: "/home/dataadmin/GBTData/SharedDataDirectory/lscx_081526/data/preprocessed"
+analysis_dir: "/home/dataadmin/GBTData/SharedDataDirectory/lscx_081526/analyses/20261110/exclusion"
+population_dir: "/home/dataadmin/GBTData/SharedDataDirectory/cband_052726/analyses/20261110/target_selection"
+calibration_dir: "/home/dataadmin/GBTData/SharedDataDirectory/cband_052726/data/median_sefds"
+whack_save_dir: "/home/dataadmin/GBTData/SharedDataDirectory/cband_052726/analyses/20261110/whack_a_moles"
+size_init: 1e-31
+ref_signal_size: 1e-2
+case: "decay"

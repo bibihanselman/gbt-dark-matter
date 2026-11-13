@@ -1,3 +1,9 @@
+'''
+Model-independent dark matter search: candidate diagnostic reports.
+Author: Benjamin Hanselman
+Date: 13 November 2026
+'''
+
 import numpy as np
 import matplotlib.pyplot as plt
 import math
