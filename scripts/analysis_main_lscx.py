@@ -31,8 +31,6 @@ from scipy.integrate import quad
 
 from whack_a_mole import WhackAMole
 
-num_processes = mp.cpu_count()
-
 c = 299792
 v_virial = 250 # km/s
 v_earth = 225 # km/s
@@ -481,8 +479,8 @@ def calculate_pvals(iter, freqs, signal_sizes, b=1, exterior=3, bank=0, **kwargs
     path_to_save = os.path.join(root_bank_dir, 'pvals', str(freqs[0]), f'iter_{iter}')
     os.makedirs(path_to_save, exist_ok=True)
     
-    np.save(os.path.join(path_to_save, 'doppler_pvals.npy'), np.array([xs, get_pvals_cont(corr_inj_dopp, corr_uninj_dopp)]))
-    np.save(os.path.join(path_to_save, 'intensity_pvals.npy'), np.array([xs, get_pvals_cont(corr_inj_int, corr_uninj_int)]))
+    np.save(os.path.join(path_to_save, 'doppler_pvals.npy'), np.array([xs, pvals_dopp]))
+    np.save(os.path.join(path_to_save, 'intensity_pvals.npy'), np.array([xs, pvals_int]))
     np.save(os.path.join(path_to_save, 'combined_pvals.npy'), np.array([xs, pvals_cont]))
     
     return pvals
@@ -574,6 +572,9 @@ if __name__ == '__main__':
     ]
     start_banks = [0, 1, 2, 6]
 
+    num = 3 if is_decay else 6
+    factor = v_earth / c + (v_virial / (c*np.sqrt(num)) * 3) * (1 + v_earth / c)
+
     start_time = time.perf_counter()
 
     for bank in banks:
@@ -658,8 +659,8 @@ if __name__ == '__main__':
         corr_uninj_int = correlate_asymmetry(xs, template_xs, asymmetry_uninj_int, template_int)
         corr_uninj_dopp = correlate_asymmetry(xs, template_xs, asymmetry_uninj_dopp, template_smooth_dopp)
 
-        pvals_int = get_pvals_cont(xs, corr_uninj_int, corr_uninj_int)
-        pvals_dopp = get_pvals_cont(xs, corr_uninj_dopp, corr_uninj_dopp)
+        pvals_int = get_pval_spectrum(xs, corr_uninj_int, corr_uninj_int)
+        pvals_dopp = get_pval_spectrum(xs, corr_uninj_dopp, corr_uninj_dopp)
         pvals_comb = np.array([combine_pvalues([pval_int, pval_dopp])[1] for pval_int, pval_dopp in zip(pvals_int, pvals_dopp)])
 
         # Plotting
@@ -716,7 +717,7 @@ if __name__ == '__main__':
                 'info': bank_info,
                 'blanking_ranges': blanking_ranges[band_idx]
             }
-            whack = WhackAMole(whack_config)
+            whack = WhackAMole(whack_config, bank=bank, is_decay=is_decay)
             whack.run(save_path=whack_save_path)
 
         print('Analysis start!')

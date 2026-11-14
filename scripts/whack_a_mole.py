@@ -37,29 +37,37 @@ class WhackAMole:
     Class for analyzing candidate dark matter signals.
     '''
 
-    def __init__(self, config, window_size=280, save=False):
+    c = 299792
+    v_virial = 250 # km/s
+    v_earth = 225 # km/s
+    dm_profile = 'nfw'
+
+    def __init__(self, config, window_size=6, bank=0, is_decay=True, save=False):
         plt.rcParams.update({'font.size': 14, 'axes.labelsize': 14})
 
         self.freqs = config['freqs']
         self.uninj_norm_spectra = config['uninj_norm_spectra']
         self.uninj_spectra = config['uninj_spectra']
         self.template_spectra = config['template_spectra']
-        self.ref_freq = config['template_freq']
+
+        self.freq_diff = self.freqs[1] - self.freqs[0]
+        num = 3 if is_decay else 6
+        self.factor = v_earth / c + (v_virial / (c*np.sqrt(num)) * 3) * (1 + v_earth / c)
+        self.template_xs = np.linspace(1-3*factor, 1+3*factor, 500)
 
         self.state_dopp = config['state_dopp']
         self.state_int = config['state_int']
         
         self.info = config['info']
+        self.time_mask = info['epoch'].apply(lambda x: int(x[4:6]) < 23).to_numpy() if bank >= 6 else None
 
         self.asymmetry_int = self.build_asymmetry(self.uninj_norm_spectra, self.state_int, self.info['phi'] < 90)
-        template_int = self.build_asymmetry(self.template_spectra, self.state_int, self.info['phi'] < 90)
-        template_xs = np.arange(len(template_int))
-        self.template_int = make_interp_spline(template_xs[::15], template_int[::15], k=3)(template_xs)
+        self.template_int = self.build_asymmetry(self.template_spectra, self.state_int, self.info['phi'] < 90)
 
         self.asymmetry_dopp = self.build_asymmetry(self.uninj_norm_spectra, self.state_dopp, self.info['theta'] < 90)
-        template_dopp = self.build_asymmetry(self.template_spectra, self.state_dopp, self.info['theta'] < 90)
-        template_xs = np.arange(len(template_dopp))
-        self.template_dopp = make_interp_spline(template_xs[::15], template_dopp[::15], k=3)(template_xs)
+        self.template_dopp = self.build_asymmetry(self.template_spectra, self.state_dopp, self.info['theta'] < 90)
+
+        self.blanking_ranges = config['blanking_ranges']
 
         self.window_size = window_size
         self.save = save
@@ -72,66 +80,52 @@ class WhackAMole:
     
     def build_asymmetry(self, specs, state, mask): #template=False
         '''Form asymmetry from a given state.'''
-        inner = (state == 1) & mask
-        outer = (state == 1) & ~mask
+        if self.time_mask is not None:
+            inner_mean_pre = np.nanmean(specs[(state == 1) & mask & self.time_mask], axis=0)
+            inner_mean_post = np.nanmean(specs[(state == 1) & mask & ~self.time_mask], axis=0)
+            outer_mean_pre = np.nanmean(specs[(state == 1) & ~mask & self.time_mask], axis=0)
+            outer_mean_post = np.nanmean(specs[(state == 1) & ~mask & ~self.time_mask], axis=0)
 
-        inner_slice = specs[inner, :]
-        outer_slice = specs[outer, :]
-        inner_mean = np.zeros(specs.shape[1])
-        outer_mean = np.zeros(specs.shape[1])
-        
-        for j in range(specs.shape[1]):
-            inner_mean[j] = inner_slice[:, j].mean()
-            outer_mean[j] = outer_slice[:, j].mean()
+            asymmetry = (inner_mean_pre + inner_mean_post - outer_mean_pre - outer_mean_post) / (inner_mean_pre + inner_mean_post + outer_mean_pre + outer_mean_post)
 
-        asymmetry = (inner_mean - outer_mean) / (inner_mean + outer_mean)
-        
+        else:
+            inner_mean = np.nanmean(specs[(state == 1) & mask], axis=0)
+            outer_mean = np.nanmean(specs[(state == 1) & ~mask], axis=0)
+
+            asymmetry = (inner_mean - outer_mean) / (inner_mean + outer_mean)
+
         return asymmetry
 
     def correlate_asymmetry(self, spectrum, template):
-        def stretch_template(template, stretch_factor):
-            if template.shape[0] % 2 == 0:
-                template = template[1:] # Make the number of points odd
-            k = template.shape[0] // 2
-            orig_x = np.arange(-k, k+1)
-            interp_func = interp1d(orig_x, template, bounds_error=False, fill_value=0)
-            new_k = ((2*k + 1)/stretch_factor - 1)/2 # 2k_1 + 1 = sf*(2k_0 + 1)
-            new_x = np.linspace(-new_k, new_k, template.shape[0])
-
-            return interp_func(new_x)
-
         def get_a(target, template):
+            target = np.nan_to_num(target)
             return np.dot(target, template) / (np.dot(template, template) + 1e-12)
         
         a_vals = np.zeros_like(spectrum)
-        residuals = np.zeros_like(spectrum)
-        lower = (len(template) - 1) // 2
-        upper = (len(template) + 1) // 2
-        for i in range(len(spectrum)):
-            if math.isnan(spectrum[i]):
-                # Set correlation to nan whenever the asymmetry is nan
-                a_vals[i] = np.nan
-                residuals[i] = 1
-            else:
-                stretched = stretch_template(template, self.freqs[i] / self.ref_freq)
-                
-                if i < lower:
-                    x = lower - i
-                    stretched = stretched[x:]
-                    window = spectrum[:i+upper]
-                elif i > (len(spectrum) - upper):
-                    x = len(spectrum) - upper - i
-                    stretched = stretched[:x]
-                    window = spectrum[i-lower:]
-                else:
-                    window = spectrum[i-lower:i+upper]
-                
-                nan_mask = np.isfinite(window)
-                a = get_a(window[nan_mask], stretched[nan_mask]) 
-                a_vals[i] = a 
-                residuals[i] = np.sqrt(np.nanmean((a*stretched-window)**2)) 
 
-        return a_vals / (residuals + 1e-12)
+        for i, freq in enumerate(self.freqs):
+            half_width_bin = float((3 * self.factor * freq) // self.freq_diff)
+            new_xs = np.arange(-half_width_bin, half_width_bin+1) * self.freq_diff + freq
+            stretched = np.interp(new_xs, freq * self.template_xs, template)
+
+            lower = (len(template) - 1) // 2
+            upper = (len(template) + 1) // 2
+            
+            if i < lower:
+                x = lower - i
+                stretched = stretched[x:]
+                window = spectrum[:i+upper]
+            elif i > (len(spectrum) - upper):
+                x = len(spectrum) - upper - i
+                stretched = stretched[:x]
+                window = spectrum[i-lower:]
+            else:
+                window = spectrum[i-lower:i+upper]
+            
+            a = get_a(window, stretched) 
+            a_vals[i] = a 
+
+        return a_vals
         
     def calc_combined_pvals(self, window_size=None):
         '''
@@ -144,25 +138,22 @@ class WhackAMole:
         corr_int = self.correlate_asymmetry(self.asymmetry_int, self.template_int)
         
         def calc_pvals(uninj):
-            window_half_size = window_size // 2
-            stds = []
-            for i in range(len(uninj)):
-                if i < window_half_size:
-                    slice = uninj[:i+window_half_size]
-                elif i >= len(uninj) - window_half_size:
-                    slice = uninj[i-window_half_size:]
+            stds = np.zeros_like(uninj)
+
+            for i, freq in enumerate(self.freqs):
+                half_width_bin = (self.window_size * self.factor * freq) // self.freq_diff
+                if i < half_width_bin:
+                    window = uninj[:i+half_width_bin+1]
+                elif i >= len(self.freqs) - half_width:
+                    window = uninj[i-half_width_bin:]
                 else:
-                    slice = uninj[i-window_half_size:i+window_half_size]
-                
-                if np.all(np.isnan(slice)):
-                    stds.append(stds[-1])
-                else:
-                    stds.append(np.nanstd(slice))
-        
+                    window = uninj[i-half_width_bin:i+half_width_bin+1]
+                stds[i] = np.nanstd(window)
+            
             sigmas = uninj / stds
             pvals = list(map(lambda sigma: .5*math.erfc(sigma/np.sqrt(2)), sigmas))
             return pvals
-        
+                
         return np.array([
             combine_pvalues([pval_dopp, pval_int])[1]
             for pval_dopp, pval_int in zip(calc_pvals(corr_dopp), calc_pvals(corr_int))
@@ -240,7 +231,7 @@ class WhackAMole:
         for spec in self.uninj_norm_spectra:
             if freq:
                 spec = spec[mask]
-            powers = spec / np.median(spec)
+            powers = spec / np.nanmedian(spec)
             ax.plot(xs, powers, c='k', alpha=0.3, rasterized=True)
 
         if freq:
@@ -272,7 +263,7 @@ class WhackAMole:
         for spec in self.uninj_spectra:
             if freq:
                 spec = spec[mask]
-            powers = spec / np.median(spec)
+            powers = spec / np.nanmedian(spec)
             ax.plot(xs, powers, c='k', alpha=0.3, rasterized=True)
 
         if freq:
@@ -310,7 +301,7 @@ class WhackAMole:
                 bin_mask = cond & (self.info[bin_column] == i).to_numpy()
                 spectra = self.uninj_norm_spectra[bin_mask][:, mask]
                 if spectra.size:
-                    avg = np.mean(spectra, axis=0)
+                    avg = np.nanmean(spectra, axis=0)
                     yield avg
                 else:
                     yield nans
@@ -418,14 +409,15 @@ class WhackAMole:
         pdf.close()
         print(f'Report saved at {save_dir}')
     
-    def exclude(self, freqs, width=50):
+    def exclude(self, freqs, size=1):
         if not isinstance(freqs, (list, np.ndarray)):
             freqs = [freqs]
         
         for freq in freqs:
+            width = int(size * self.factor * freq / self.freq_diff)
             idx = np.argmin(np.abs(freq - self.freqs))
-            self.asymmetry_dopp[idx-width:idx+width] = np.nan
-            self.asymmetry_int[idx-width:idx+width] = np.nan
+            self.asymmetry_dopp[idx-width:idx+width+1] = np.nan
+            self.asymmetry_int[idx-width:idx+width+1] = np.nan
     
     def run(self, save_path=None):
         '''
